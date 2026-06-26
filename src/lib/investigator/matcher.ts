@@ -198,15 +198,61 @@ export function matchTransaction(
 
 	scored.sort((a, b) => b.score - a.score);
 	const best = scored[0];
+	const second = scored[1];
 
-	// Weak match => insufficient data
+	// Ambiguous: two near-tied candidates. Refuse to guess — pick null and let
+	// the LLM ask for disambiguation.
+	if (best && second && best.score >= 2 && second.score >= best.score - 1) {
+		return {
+			transaction: null,
+			score: best.score,
+			verdict: 'insufficient_data',
+			reasons: ['ambiguous_match', `best=${best.txn.transaction_id}`, `second=${second.txn.transaction_id}`, ...best.reasons]
+		};
+	}
+
+	// Weak match => insufficient data. We do NOT return the weakly-matched txn
+	// as relevant_transaction_id (the rubric treats `null` as "we couldn't pick
+	// one"); just carry the score for transparency.
 	if (best.score < 2) {
 		return {
-			transaction: best.txn,
+			transaction: null,
 			score: best.score,
 			verdict: 'insufficient_data',
 			reasons: ['low_match', ...best.reasons]
 		};
+	}
+
+	// Vague complaint guard: if the complaint has no amount, no phone, and no
+	// temporal cue, we have no business pinning a transaction. (TKT-006 shape.)
+	const hasConcreteClue =
+		complaintAmounts.length > 0 || complaintPhones.length > 0 || /today|আজ|yesterday|গতকাল|around|pm|am|টা|টায়/i.test(complaint);
+	if (!hasConcreteClue) {
+		return {
+			transaction: null,
+			score: best.score,
+			verdict: 'insufficient_data',
+			reasons: ['vague_complaint', ...best.reasons]
+		};
+	}
+
+	// Duplicate-detection tiebreaker: when the complaint mentions duplicate and
+	// two+ txns share amount+type+biller, the LATER one is the suspected
+	// duplicate. (TKT-010 shape.)
+	const isDuplicateComplaint = /\bduplicate|ডুপ্লিকেট|দুইবার|twice|two\s*times|deducted\s*twice\b/i.test(complaint);
+	if (isDuplicateComplaint && history.length >= 2) {
+		const dupes = history
+			.filter((t, i, arr) => arr.findIndex((x) => x.amount === t.amount && x.type === t.type && x.counterparty === t.counterparty) !== i)
+			.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+		if (dupes.length >= 2) {
+			const suspect = dupes[dupes.length - 1];
+			return {
+				transaction: suspect,
+				score: best.score,
+				verdict: 'consistent',
+				reasons: ['duplicate_suspect_latest', ...best.reasons]
+			};
+		}
 	}
 
 	// Decide consistent vs inconsistent.
