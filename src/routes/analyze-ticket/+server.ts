@@ -115,7 +115,7 @@ export const POST: RequestHandler = async ({ request }) => {
 	};
 
 	try {
-		const result = analyze(req);
+		const result = await analyze(req);
 		return json(result, { status: 200 });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : 'Internal error';

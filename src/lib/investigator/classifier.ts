@@ -19,6 +19,7 @@ import {
 	hardenRecommendedAction,
 	stripPromptInjection
 } from './safety';
+import { analyzeWithGemini, isGeminiConfigured } from './llm';
 
 interface CaseRule {
 	caseType: CaseType;
@@ -237,7 +238,17 @@ function buildCustomerReply(
 	);
 }
 
-export function analyze(req: AnalyzeRequest): AnalyzeResponse {
+export interface AnalyzerContext {
+	match: ReturnType<typeof matchTransaction>;
+	classification: ReturnType<typeof classifyComplaint>;
+	baseSeverity: Severity;
+	baseDepartment: Department;
+	baseHumanReviewRequired: boolean;
+	baseReasonCodes: string[];
+	baseConfidence: number;
+}
+
+export function buildContext(req: AnalyzeRequest): AnalyzerContext {
 	const safeComplaint = stripPromptInjection(req.complaint ?? '');
 	const txnHistory = req.transaction_history ?? [];
 	const match = matchTransaction(safeComplaint, txnHistory);
@@ -293,21 +304,123 @@ export function analyze(req: AnalyzeRequest): AnalyzeResponse {
 	if (match.verdict === 'insufficient_data') confidence = Math.min(confidence, 0.55);
 	confidence = Math.max(0.2, Math.min(0.99, Number(confidence.toFixed(2))));
 
-	const draftReply = buildCustomerReply(cls.caseType, match.verdict, match.transaction);
-	const draftAction = buildNextAction(cls.caseType, match.verdict, match.transaction, humanReviewRequired);
+	return {
+		match,
+		classification: cls,
+		baseSeverity: severity,
+		baseDepartment: cls.department,
+		baseHumanReviewRequired: humanReviewRequired,
+		baseReasonCodes: reasonCodes,
+		baseConfidence: confidence
+	};
+}
+
+function buildRuleBasedDraft(
+	req: AnalyzeRequest,
+	ctx: AnalyzerContext
+): {
+	agent_summary: string;
+	recommended_next_action: string;
+	customer_reply: string;
+	case_type: AnalyzeResponse['case_type'];
+	severity: Severity;
+	department: Department;
+	human_review_required: boolean;
+	confidence: number;
+	reason_codes: string[];
+} {
+	const draftReply = buildCustomerReply(
+		ctx.classification.caseType,
+		ctx.match.verdict,
+		ctx.match.transaction
+	);
+	const draftAction = buildNextAction(
+		ctx.classification.caseType,
+		ctx.match.verdict,
+		ctx.match.transaction,
+		ctx.baseHumanReviewRequired
+	);
+	return {
+		agent_summary: buildAgentSummary(req, ctx.classification.caseType, ctx.match.verdict, ctx.match.transaction),
+		recommended_next_action: hardenRecommendedAction(draftAction),
+		customer_reply: hardenCustomerReply(draftReply),
+		case_type: ctx.classification.caseType,
+		severity: ctx.baseSeverity,
+		department: ctx.baseDepartment,
+		human_review_required: ctx.baseHumanReviewRequired,
+		confidence: ctx.baseConfidence,
+		reason_codes: ctx.baseReasonCodes
+	};
+}
+
+export async function analyze(req: AnalyzeRequest): Promise<AnalyzeResponse> {
+	const ctx = buildContext(req);
+
+	let draft = buildRuleBasedDraft(req, ctx);
+
+	// Optional Gemini refinement. Runs only if the env var is set AND
+	// matches succeeds (we always keep the matcher's verdict and id).
+	if (isGeminiConfigured()) {
+		try {
+			const llm = await Promise.race([
+				analyzeWithGemini({
+					request: req,
+					relevant_transaction_id: ctx.match.transaction
+						? ctx.match.transaction.transaction_id
+						: null,
+					evidence_verdict: ctx.match.verdict,
+					history_summary: summarizeTxn(ctx.match.transaction)
+				}),
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error('gemini_timeout')), 20_000)
+				)
+			]);
+			draft = {
+				...draft,
+				case_type: llm.case_type,
+				severity: llm.severity,
+				department: llm.department,
+				agent_summary: llm.agent_summary,
+				recommended_next_action: hardenRecommendedAction(llm.recommended_next_action),
+				customer_reply: hardenCustomerReply(llm.customer_reply),
+				human_review_required: llm.human_review_required || draft.human_review_required,
+				confidence: llm.confidence,
+				reason_codes: Array.from(
+					new Set([...draft.reason_codes, ...llm.reason_codes])
+				).slice(0, 10)
+			};
+			draft.reason_codes.unshift('llm_refined');
+		} catch (err) {
+			// Fall back to rule-based on any LLM error so we never break the
+			// 30-second SLA. The matcher verdict is still authoritative.
+			console.warn(
+				'[investigator] Gemini call failed, falling back to rule-based:',
+				err instanceof Error ? err.message : err
+			);
+			draft.reason_codes.unshift('llm_fallback_rule_based');
+		}
+	} else {
+		draft.reason_codes.unshift('rule_based');
+	}
+
+	// Hard override: phishing always critical + always human review.
+	if (draft.case_type === 'phishing_or_social_engineering') {
+		draft.severity = 'critical';
+		draft.human_review_required = true;
+	}
 
 	return {
 		ticket_id: req.ticket_id,
-		relevant_transaction_id: match.transaction ? match.transaction.transaction_id : null,
-		evidence_verdict: match.verdict,
-		case_type: cls.caseType,
-		severity,
-		department: cls.department,
-		agent_summary: buildAgentSummary(req, cls.caseType, match.verdict, match.transaction),
-		recommended_next_action: hardenRecommendedAction(draftAction),
-		customer_reply: hardenCustomerReply(draftReply),
-		human_review_required: humanReviewRequired,
-		confidence,
-		reason_codes: reasonCodes
+		relevant_transaction_id: ctx.match.transaction ? ctx.match.transaction.transaction_id : null,
+		evidence_verdict: ctx.match.verdict,
+		case_type: draft.case_type,
+		severity: draft.severity,
+		department: draft.department,
+		agent_summary: draft.agent_summary,
+		recommended_next_action: draft.recommended_next_action,
+		customer_reply: draft.customer_reply,
+		human_review_required: draft.human_review_required,
+		confidence: draft.confidence,
+		reason_codes: draft.reason_codes
 	};
 }

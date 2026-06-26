@@ -40,3 +40,26 @@ npm run build
 You can preview the production build with `npm run preview`.
 
 > To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+
+## QueueStorm Investigator API
+
+This project exposes two HTTP endpoints:
+
+- `GET /health` → `{"status":"ok"}`
+- `POST /analyze-ticket` → structured JSON per the spec in `docs/` (case_type, severity, department, evidence_verdict, agent_summary, recommended_next_action, customer_reply, human_review_required, confidence, reason_codes, …).
+
+The matcher in `src/lib/investigator/matcher.ts` is the deterministic source of truth for `relevant_transaction_id` and `evidence_verdict`.
+
+### Optional: Gemini-powered reasoning
+
+Case classification and the agent/customer text can be refined by Google's Gemini. To enable:
+
+```sh
+cp .env.example .env
+# edit .env and set GEMINI_API_KEY
+pnpm dev
+```
+
+With `GEMINI_API_KEY` set, the service calls `gemini-2.5-flash` (override with `GEMINI_MODEL`) using `responseSchema` to pin every enum to the spec. A 20-second timeout protects the per-request SLA; on any error the service falls back to the rule-based pipeline so the API still answers within 30 seconds. The safety filter in `src/lib/investigator/safety.ts` always runs on the final reply, whether it came from Gemini or from the rule-based draft.
+
+Without a key, the service runs fully offline.
