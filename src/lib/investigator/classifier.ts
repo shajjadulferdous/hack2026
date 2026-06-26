@@ -14,7 +14,7 @@
 import type { AnalyzeRequest, AnalyzeResponse, Transaction } from './types';
 import { matchTransaction } from './matcher';
 import { hardenCustomerReply, hardenRecommendedAction, stripPromptInjection } from './safety';
-import { analyzeWithGemini, isGeminiConfigured } from './llm';
+import { analyzeWithGemini, GeminiQuotaError, isGeminiConfigured } from './llm';
 
 function summarizeTxn(txn: Transaction | null): string {
 	if (!txn) return 'no transaction in recent history';
@@ -51,15 +51,22 @@ export async function analyze(req: AnalyzeRequest): Promise<AnalyzeResponse> {
 	// transaction id. There is no rule-based fallback — if the model fails
 	// or the key is missing, we say so honestly and return insufficient_data
 	// so a human can pick it up.
+	const QUOTA_HIT_REPLY =
+		'Thank you for reaching out. Our team is reviewing your case and will ' +
+		'follow up through official support channels listed in the app. We will ' +
+		'never ask for your PIN, OTP, password, or card number.';
+	const QUOTA_HIT_ACTION =
+		'Route this ticket to a human reviewer; the AI investigator could not ' +
+		'process it right now. Do not confirm any refund or reversal until policy ' +
+		'and fraud checks are complete.';
+
 	if (!isGeminiConfigured()) {
 		console.warn('[investigator] GEMINI_API_KEY not set; LLM unavailable.');
 		return {
 			...base,
 			agent_summary: 'AI quota unavailable. This ticket needs human review.',
-			recommended_next_action:
-				'Route this ticket to a human reviewer; the AI investigator could not process it right now.',
-			customer_reply:
-				'Thank you for reaching out. Our team is reviewing your case and will follow up through official channels.',
+			recommended_next_action: hardenRecommendedAction(QUOTA_HIT_ACTION),
+			customer_reply: hardenCustomerReply(QUOTA_HIT_REPLY),
 			human_review_required: true,
 			confidence: 0,
 			reason_codes: ['llm_unavailable']
@@ -77,6 +84,7 @@ export async function analyze(req: AnalyzeRequest): Promise<AnalyzeResponse> {
 				setTimeout(() => reject(new Error('gemini_timeout')), 8_000)
 			)
 		]);
+		const confidence = Math.max(0, Math.min(1, Number(llm.confidence) || 0));
 		return {
 			...base,
 			evidence_verdict: llm.evidence_verdict,
@@ -87,24 +95,27 @@ export async function analyze(req: AnalyzeRequest): Promise<AnalyzeResponse> {
 			recommended_next_action: hardenRecommendedAction(llm.recommended_next_action),
 			customer_reply: hardenCustomerReply(llm.customer_reply),
 			human_review_required: llm.human_review_required,
-			confidence: llm.confidence,
+			confidence,
 			reason_codes: ['llm', ...llm.reason_codes].slice(0, 10)
 		};
 	} catch (err) {
+		const isQuota = err instanceof GeminiQuotaError;
+		// Log a short, safe summary — never dump the raw SDK error blob
+		// (it can contain quota metadata and retry timing).
+		const summary = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
 		console.warn(
-			'[investigator] Gemini call failed (quota or error):',
-			err instanceof Error ? err.message : err
+			`[investigator] Gemini call failed (${isQuota ? 'quota' : 'error'}): ${summary}`
 		);
 		return {
 			...base,
-			agent_summary: 'AI quota hit. This ticket needs human review.',
-			recommended_next_action:
-				'Route this ticket to a human reviewer; the AI investigator hit a quota limit and could not process it right now.',
-			customer_reply:
-				'Thank you for reaching out. Our team is reviewing your case and will follow up through official channels.',
+			agent_summary: isQuota
+				? 'AI quota hit. This ticket needs human review.'
+				: 'AI investigator encountered an error. This ticket needs human review.',
+			recommended_next_action: hardenRecommendedAction(QUOTA_HIT_ACTION),
+			customer_reply: hardenCustomerReply(QUOTA_HIT_REPLY),
 			human_review_required: true,
 			confidence: 0,
-			reason_codes: ['llm_quota_hit']
+			reason_codes: [isQuota ? 'llm_quota_hit' : 'llm_error']
 		};
 	}
 }

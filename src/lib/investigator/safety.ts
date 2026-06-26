@@ -36,12 +36,18 @@ const FORBIDDEN_CONFIRM_PATTERNS: RegExp[] = [
 ];
 
 const FORBIDDEN_THIRD_PARTY_PATTERNS: RegExp[] = [
-	/\bcall\s+(?:the\s+)?(?:number|person|guy|bhai|bro)\s+at\b/i,
-	/\bcontact\s+(?:the\s+)?(?:number|person|guy|bhai|bro)\s+at\b/i,
+	/\bcall\s+(?:the\s+)?(?:number|person|guy|bhai|bro|him|her|them)\s+at\b/i,
+	/\bcontact\s+(?:the\s+)?(?:number|person|guy|bhai|bro|him|her|them)\s+at\b/i,
 	/\bmeet\s+(?:the\s+)?agent\b/i,
 	/\bsend\s+(?:the\s+)?money\s+to\s+this\s+number\b/i,
-	/\bshare\s+(?:your\s+)?pin\b/i,
-	/\bgive\s+(?:him|her|them)\s+(?:the\s+)?(?:pin|otp|code)\b/i
+	/\bshare\s+(?:your\s+)?(?:pin|otp|password|account|secret|code)\b/i,
+	/\bgive\s+(?:him|her|them)\s+(?:the\s+)?(?:pin|otp|code)\b/i,
+	/\bvisit\s+(?:our|the)\s+(?:branch|office)\s+(?:at|on)\b/i,
+	/\bgo\s+to\s+(?:our|the)\s+(?:branch|office)\s+at\b/i,
+	/\baccount\s+number\b/i,
+	/\bbank\s+account\s+(?:number|details)\b/i,
+	/\bsend\s+(?:your|the)\s+(?:account|a\/c)\s+(?:number|details)\b/i,
+	/\bplease\s+provide\s+your\s+(?:pin|otp|password|account|secret)\b/i
 ];
 
 export function stripPromptInjection(input: string): string {

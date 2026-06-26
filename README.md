@@ -1,91 +1,151 @@
-# sv
+# QueueStorm Investigator
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+An internal copilot for support agents at a Bangladesh digital-finance platform.
+Given a customer complaint and a short window of recent transactions, the
+service produces a structured triage packet so an agent can resolve the ticket
+in one pass:
 
-## Creating a project
+- what **kind** of case it is (`case_type`)
+- which **transaction** in the customer's history is relevant
+- whether the data **supports** the customer's claim (`evidence_verdict`)
+- how **urgent** it is (`severity`) and which team should pick it up (`department`)
+- a one-line **agent summary**, a recommended **next action**, and a safe
+  **customer reply**
+- whether the ticket should be **escalated to a human** (`human_review_required`)
+- a `confidence` score and `reason_codes` explaining the decision
 
-If you're seeing this, you've probably already done this step. Congrats!
+Built for the SUST CSE Carnival 2026 / Codex Community Hackathon online
+preliminary.
 
-```sh
-# create a new project
-npx sv create my-app
+## How it works
+
+Two stages:
+
+1. **Deterministic matcher** (`src/lib/investigator/matcher.ts`) — picks the
+   single transaction from `transaction_history` that the complaint most
+   plausibly refers to (amount, counterparty digits, time-of-day clues,
+   duplicate-pattern detection, status hints). It never asks the model to
+   invent a transaction id.
+
+2. **LLM investigator** (`src/lib/investigator/llm.ts` + `classifier.ts`) —
+   when `GEMINI_API_KEY` is set, calls Gemini (`gemini-2.5-flash` by default,
+   override with `GEMINI_MODEL`) and lets the model be the single source of
+   truth for every other field. The response is pinned with `responseSchema`
+   so enums can't drift. A safety filter (`safety.ts`) runs on the model's
+   output to strip prompt injection and lock down the customer reply.
+
+If the API key is missing or the LLM call fails (quota, timeout, network),
+the service returns an honest `llm_unavailable` / `llm_quota_hit` packet
+with `human_review_required: true` instead of guessing from regexes — the
+point is that a human agent owns anything the model couldn't process.
+
+## API
+
+Two endpoints:
+
+- `GET  /health` → `{"status":"ok"}`
+- `POST /analyze-ticket` → the full triage packet
+
+`POST /analyze-ticket` body:
+
+```json
+{
+  "ticket_id": "TKT-001",
+  "complaint": "I sent 5000 taka to a wrong number around 2pm today. The number was supposed to be 01712345678 but I think I typed it wrong.",
+  "language": "en",
+  "channel": "in_app_chat",
+  "user_type": "customer",
+  "campaign_context": "boishakh_bonanza_day_1",
+  "transaction_history": [
+    { "transaction_id": "TXN-9101", "timestamp": "2026-04-14T14:08:22Z", "type": "transfer", "amount": 5000, "counterparty": "+8801719876543", "status": "completed" }
+  ]
+}
 ```
 
-To recreate this project with the same configuration:
+Response (truncated):
 
-```sh
-# recreate this project
-pnpm dlx sv@0.16.1 create --template minimal --types ts --add prettier eslint vitest="usages:unit" tailwindcss="plugins:forms,typography" --install pnpm hack
+```json
+{
+  "ticket_id": "TKT-001",
+  "relevant_transaction_id": "TXN-9101",
+  "evidence_verdict": "consistent",
+  "case_type": "wrong_transfer",
+  "severity": "high",
+  "department": "dispute_resolution",
+  "agent_summary": "Customer mistakenly sent 5000 BDT to an incorrect recipient...",
+  "recommended_next_action": "Initiate an investigation for the wrong transfer (TXN-9101)...",
+  "customer_reply": "We understand you're concerned about a recent transfer...",
+  "human_review_required": true,
+  "confidence": 0.9,
+  "reason_codes": ["llm", "wrong_transfer", "consistent"]
+}
 ```
 
-## Developing
+The browser dashboard at `/` lets you paste a complaint + transaction history
+and inspect the live verdict, reasoning, and the customer reply the model
+generated.
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+## Local development
+
+Requires Node 20+ and pnpm.
 
 ```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
+pnpm install
+cp .env.example .env.local       # then edit .env.local
+pnpm dev                         # http://localhost:5173
 ```
 
-## Building
+`.env.local` keys:
 
-To create a production version of your app:
+| Key              | Default              | Notes                                            |
+| ---------------- | -------------------- | ------------------------------------------------ |
+| `GEMINI_API_KEY` | _(required for LLM)_ | Without it, every request returns `llm_unavailable`. |
+| `GEMINI_MODEL`   | `gemini-2.5-flash`   | Any Gemini model name.                           |
 
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
-
-## QueueStorm Investigator API
-
-This project exposes two HTTP endpoints:
-
-- `GET /health` → `{"status":"ok"}`
-- `POST /analyze-ticket` → structured JSON per the spec in `docs/` (case_type, severity, department, evidence_verdict, agent_summary, recommended_next_action, customer_reply, human_review_required, confidence, reason_codes, …).
-
-The matcher in `src/lib/investigator/matcher.ts` is the deterministic source of truth for `relevant_transaction_id` and `evidence_verdict`.
-
-### Optional: Gemini-powered reasoning
-
-Case classification and the agent/customer text can be refined by Google's Gemini. To enable:
+Try it:
 
 ```sh
-cp .env.example .env
-# edit .env and set GEMINI_API_KEY
-pnpm dev
-```
-
-With `GEMINI_API_KEY` set, the service calls `gemini-2.5-flash` (override with `GEMINI_MODEL`) using `responseSchema` to pin every enum to the spec. A 20-second timeout protects the per-request SLA; on any error the service falls back to the rule-based pipeline so the API still answers within 30 seconds. The safety filter in `src/lib/investigator/safety.ts` always runs on the final reply, whether it came from Gemini or from the rule-based draft.
-
-Without a key, the service runs fully offline.
-
-### Running with Docker
-
-The repo ships a multi-stage `Dockerfile` that builds the SvelteKit app and serves it on port `8000`:
-
-```sh
-docker build -t queuestorm-investigator .
-docker run --rm -p 8000:8000 queuestorm-investigator
-```
-
-Then:
-
-```sh
-curl http://localhost:8000/health
-curl -X POST http://localhost:8000/analyze-ticket \
+curl http://localhost:5173/health
+curl -X POST http://localhost:5173/analyze-ticket \
   -H 'content-type: application/json' \
-  -d '{"ticket_id":"TKT-001","complaint":"I sent 5000 taka to a wrong number around 2pm today","transaction_history":[{"transaction_id":"TXN-9101","timestamp":"2026-04-14T14:08:22Z","type":"transfer","amount":5000,"counterparty":"+8801719876543","status":"completed"}]}'
+  -d @sample-ticket.json
 ```
 
-To enable the optional `[redacted]` refinement inside the container:
+The request file `SUST_Preli_Sample_Cases.json` in the repo root is the
+official prelim sample case pack — feed it through the dashboard or `curl`
+loop to sanity-check the model.
+
+## Production build
 
 ```sh
-docker run --rm -p 8000:8000 -e GEMINI_API_KEY="$GEMINI_API_KEY" queuestorm-investigator
+pnpm build      # produces build/ and .svelte-kit/output/
+pnpm preview    # serves the production build locally
 ```
 
-Override the model with `-e GEMINI_MODEL=...`. Without `GEMINI_API_KEY` the service runs fully offline on the rule-based pipeline.
+Other useful scripts:
+
+```sh
+pnpm check        # svelte-check — type and a11y errors
+pnpm lint         # prettier --check + eslint
+pnpm format       # prettier --write
+pnpm test:unit    # vitest
+```
+
+## Project layout
+
+```
+src/
+├── routes/
+│   ├── +layout.svelte         # shared chrome + Tailwind import
+│   ├── +page.svelte           # the investigator dashboard
+│   ├── health/+server.ts      # GET /health
+│   └── analyze-ticket/        # POST /analyze-ticket
+│       └── +server.ts
+└── lib/
+    └── investigator/
+        ├── classifier.ts      # orchestrator (matcher → LLM, quota handling)
+        ├── matcher.ts         # deterministic transaction picker
+        ├── llm.ts             # Gemini call + system prompt + response schema
+        ├── safety.ts          # post-hoc reply/action hardening
+        └── types.ts           # AnalyzeRequest / AnalyzeResponse / enums
+```

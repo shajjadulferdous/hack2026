@@ -45,6 +45,13 @@ const SEVERITY_VALUES: Severity[] = ['low', 'medium', 'high', 'critical'];
 
 const VERDICT_VALUES = ['consistent', 'inconsistent', 'insufficient_data'] as const;
 
+export class GeminiQuotaError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'GeminiQuotaError';
+	}
+}
+
 const RESPONSE_SCHEMA = {
 	type: Type.OBJECT,
 	properties: {
@@ -149,6 +156,67 @@ complaints, duplicate-charge allegations, phishing reports, settlement delays, o
 agent cash-in issues. None of those are outcome-contradictions; they are requests
 for help, and a completed row supports (not contradicts) the request.
 
+WORKED EXAMPLES (use these to anchor your decision):
+
+  A. Complaint: "Payment failed but my balance was deducted."
+     Row: status=completed, amount matches. → consistent. (status=completed
+     supports the "money was deducted" part of the claim.) severity=medium,
+     department=payments_ops, human_review_required=true.
+
+  B. Complaint: "Payment failed."
+     Row: status=completed, amount matches. → inconsistent. (status=completed
+     DIRECTLY contradicts "failed".) severity=medium, department=payments_ops,
+     human_review_required=true (per hard rule #6).
+
+  C. Complaint: "I sent 2000 to a wrong number by mistake. Please reverse it."
+     Row: status=completed transfer to a counterparty. → consistent. (Row
+     confirms money left, which is the premise of the complaint.) severity=high,
+     department=dispute_resolution, human_review_required=true.
+
+  D. Complaint: "Please refund 500 BDT, I changed my mind about the merchant."
+     Row: status=completed payment to a merchant. → consistent. (Row confirms
+     the customer paid.) severity=low, department=customer_support,
+     human_review_required=false. reason_codes include "merchant_policy_dependent".
+
+  E. Complaint: "I was charged twice for the same bill."
+     Row: TWO completed payments of the same amount within minutes, same
+     counterparty. → consistent. (Row confirms the duplicate.) severity=high,
+     department=payments_ops, human_review_required=true.
+
+  F. Complaint: "I gave cash to an agent for cash-in but it never reflected."
+     Row: no cash_in row, or cash_in with status=pending. → insufficient_data.
+     severity=high, department=agent_operations, human_review_required=true.
+
+  G. Complaint: "My settlement is delayed, it's been 7 days."
+     Row: settlement row with status=pending. → consistent. severity=medium,
+     department=merchant_operations, human_review_required=false.
+
+  H. Complaint: "Someone called pretending to be support and asked for my OTP,
+     I gave it to them." Row: any / no relevant row. → consistent. severity=critical,
+     department=fraud_risk, human_review_required=true (per hard rule #7).
+
+  I. Complaint: "Payment failed." Row: status=failed, same amount.
+     → consistent. severity=medium, department=payments_ops.
+
+  J. Complaint: "My balance was deducted" (no failed/success stated).
+     Row: status=failed. → insufficient_data. (status=failed doesn't prove
+     whether the balance was actually charged; row alone cannot decide.)
+
+CASE_TYPE MAPPING (use this when the customer's complaint is about a distinct
+scenario, not a generic refund request):
+  - "wrong number / wrong person / wrong recipient / sent by mistake / typed wrong /
+    mis-sent" → wrong_transfer
+  - "payment failed / transaction failed / money deducted but failed / double charged
+    without resolution" → payment_failed
+  - "I was charged twice / two times / duplicate" → duplicate_payment
+  - "refund / return my money / cashback" against a merchant payment → refund_request
+  - "settlement pending / settlement delayed / merchant payout late" → merchant_settlement_delay
+  - "agent cash-in / agent didn't give me cash / deposit not reflected / bKash agent
+    didn't credit" → agent_cash_in_issue
+  - "phishing / scam / OTP shared / PIN shared / someone called pretending to be
+    support / suspicious link" → phishing_or_social_engineering
+  - anything else → other
+
 Severity calibration:
   - "low"      — change-of-mind refund against a completed merchant payment,
                  general informational / policy questions, completed transactions
@@ -236,11 +304,18 @@ export async function analyzeWithGemini(input: GeminiInput): Promise<GeminiOutpu
 			responseMimeType: 'application/json',
 			responseSchema: RESPONSE_SCHEMA,
 			temperature: 0.2,
-			maxOutputTokens: 1024
+			maxOutputTokens: 2048
 		}
 	});
 
+	// Detect quota / rate-limit errors. The @google/genai SDK sometimes
+	// returns these as the response text instead of throwing — treat them
+	// as quota_exceeded so the classifier can fall back cleanly.
 	const text = response.text ?? '';
+	if (text.includes('"code":429') || text.includes('RESOURCE_EXHAUSTED')) {
+		throw new GeminiQuotaError(text.slice(0, 120));
+	}
+
 	let parsed: Record<string, unknown>;
 	try {
 		parsed = JSON.parse(text) as Record<string, unknown>;
