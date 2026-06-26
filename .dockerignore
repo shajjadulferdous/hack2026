@@ -1,0 +1,15 @@
+node_modules
+.svelte-kit
+build
+.vite
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+README.md
+.DS_Store
+*.log
+pnpm-debug.log*
+.puku
+.vscode

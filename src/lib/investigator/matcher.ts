@@ -49,23 +49,30 @@ export function extractPhoneLike(input: string): string[] {
 
 function extractAmounts(complaint: string): number[] {
 	const text = normalizeDigits(complaint);
-	// Patterns: "5000", "5,000", "5.000", "5k", "5 thousand", "5 lakh"
 	const out: number[] = [];
 	const push = (n: number) => {
 		if (Number.isFinite(n) && n > 0) out.push(n);
 	};
-	const re = /(?:tk|taka|bdt|৳)?\s*(\d{1,3}(?:[,.\s]\d{2,3})*|\d+)(?:\s*(?:k|thousand|lakh|lac|crore))?/gi;
+	// Patterns: "5000", "5,000", "5.000", "5k", "5 thousand", "5 lakh".
+	// Grouped form is tried FIRST so "5,000" doesn't get split as "5" + "000"
+// (JS regex alternation is left-to-right, not longest). Plain \d+ is the
+// fallback so un-grouped numbers like "5000" or "01712345678" still match.
+	const re = /(?:tk|taka|bdt|৳)?\s*(?:\d{1,3}(?:[,.\s]\d{2,3})+|\d+)(?:\s*(k|thousand|lakh|lac|crore))?\b/gi;
 	let m: RegExpExecArray | null;
 	while ((m = re.exec(text)) !== null) {
-		const raw = m[1].replace(/[,.\s]/g, '');
+		const raw = m[0].replace(/[,.\s]/g, '').replace(/^\D+|\D+$/g, '');
 		const num = Number(raw);
-		if (!Number.isFinite(num)) continue;
-		const tail = text.slice(m.index + m[0].length - (m[2]?.length ?? 0), m.index + m[0].length);
-		const head = text.slice(Math.max(0, m.index - 4), m.index).toLowerCase();
+		if (!Number.isFinite(num) || num <= 0) continue;
+		const tailWord = (m[1] ?? '').toLowerCase();
+		const head = text.slice(Math.max(0, m.index - 6), m.index).toLowerCase();
 		let value = num;
-		if (/\bk\b|\bthousand\b/i.test(tail + head)) value = num * 1000;
-		else if (/\blakh\b|\blac\b/i.test(tail)) value = num * 100000;
-		else if (/\bcrore\b/i.test(tail)) value = num * 10000000;
+		if (tailWord === 'k' || tailWord === 'thousand' || /\bthousand\b/.test(head)) {
+			value = num * 1000;
+		} else if (tailWord === 'lakh' || tailWord === 'lac') {
+			value = num * 100000;
+		} else if (tailWord === 'crore') {
+			value = num * 10000000;
+		}
 		push(value);
 	}
 	return out;
@@ -218,13 +225,21 @@ function decideVerdict(txn: Transaction, complaint: string): EvidenceVerdict {
 	const c = complaint.toLowerCase();
 	const isFailedClaim = /\b(failed|ব্যর্থ|ফেইল|কাটেনি|কাটে নাই|কাটেনি)\b/.test(c);
 	const isDeductedClaim = /\b(deducted|cut|কেটে|কাটা|কেটেছে|কাটছে|কেটে নিয়েছে)\b/.test(c);
-	const isRefundClaim = /\b(refund|ফেরত|রিফান্ড|টাকা ফেরত)\b/.test(c);
+	const isRefundClaim = /\b(refund|reverse|revert|undo|cash\s*back|send\s*back|ফেরত|রিফান্ড|টাকা\s*ফেরত|ফেরত\s*দিন|ফেরত\s*চাই)\b/.test(c);
 	const isCashInClaim = /\b(cash\s*in|deposit|জমা|ডিপোজিট|ক্যাশ ইন)\b/.test(c);
 	const isSettlementClaim = /\b(settlement|সেটেলমেন্ট|মার্চেন্ট|merchant)\b/.test(c);
 
 	if (isFailedClaim && txn.status === 'completed') return 'inconsistent';
-	if (isDeductedClaim && txn.status === 'failed') return 'inconsistent';
-	if (isRefundClaim && txn.type !== 'refund' && txn.status === 'completed') return 'inconsistent';
+	// "deducted" + txn.status='failed' is NOT inconsistent: the gateway may
+	// have reported failed while the customer's balance was still charged.
+	// We can't prove either side from the row alone — punt to insufficient_data.
+	if (isDeductedClaim && txn.status === 'failed') return 'insufficient_data';
+	// A refund request against a non-refund row is NOT by itself inconsistent:
+	// the row is a snapshot of past transactions, the customer is asking for
+	// FUTURE action. Only return insufficient_data here so the LLM (and the
+	// final classifier) can decide whether the merchant-policy / change-of-mind
+	// reply is appropriate.
+	if (isRefundClaim && txn.type !== 'refund') return 'insufficient_data';
 	if (isCashInClaim && txn.status === 'completed' && txn.type === 'cash_in') return 'consistent';
 	if (isSettlementClaim && txn.type === 'settlement' && txn.status === 'pending') return 'consistent';
 	if (isFailedClaim && txn.status === 'failed') return 'consistent';

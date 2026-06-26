@@ -1,8 +1,20 @@
-// Classifier + investigator pipeline.
+// Investigator pipeline.
 //
-// Combines the matched transaction with keyword/heuristic rules over the
-// complaint text to produce the full structured response. Every output
-// field is constrained to the spec's enums.
+// Two paths:
+//
+//  1. LLM path (preferred) — when GEMINI_API_KEY is set, the model is the
+//     single source of truth for case_type, evidence_verdict, severity,
+//     department, agent_summary, recommended_next_action, customer_reply,
+//     human_review_required, confidence, and reason_codes. The deterministic
+//     matcher still picks the relevant_transaction_id (we never let the
+//     model hallucinate one).
+//
+//  2. Rule-based fallback — used when the API key is missing or the LLM
+//     call fails. Reasonable but not as accurate.
+//
+// All strings are run through the safety filter (hardenCustomerReply /
+// hardenRecommendedAction / stripPromptInjection) regardless of which path
+// produced them.
 
 import type {
 	AnalyzeRequest,
@@ -12,14 +24,15 @@ import type {
 	Severity,
 	Transaction
 } from './types';
-import { normalizeDigits } from './matcher';
-import { matchTransaction } from './matcher';
+import { normalizeDigits, matchTransaction } from './matcher';
 import {
 	hardenCustomerReply,
 	hardenRecommendedAction,
 	stripPromptInjection
 } from './safety';
 import { analyzeWithGemini, isGeminiConfigured } from './llm';
+
+// ---------- Rule-based fallback (only used when LLM is unavailable) ----------
 
 interface CaseRule {
 	caseType: CaseType;
@@ -124,13 +137,6 @@ function classifyComplaint(
 	};
 }
 
-function bumpSeverity(base: Severity, amount: number): Severity {
-	const order: Severity[] = ['low', 'medium', 'high', 'critical'];
-	const idx = order.indexOf(base);
-	const next = Math.min(order.length - 1, Math.max(0, idx + amount));
-	return order[next];
-}
-
 function summarizeTxn(txn: Transaction | null): string {
 	if (!txn) return 'no transaction in recent history';
 	const dt = new Date(txn.timestamp);
@@ -139,7 +145,6 @@ function summarizeTxn(txn: Transaction | null): string {
 }
 
 function buildAgentSummary(
-	req: AnalyzeRequest,
 	caseType: CaseType,
 	verdict: AnalyzeResponse['evidence_verdict'],
 	txn: Transaction | null
@@ -238,29 +243,27 @@ function buildCustomerReply(
 	);
 }
 
-export interface AnalyzerContext {
-	match: ReturnType<typeof matchTransaction>;
-	classification: ReturnType<typeof classifyComplaint>;
-	baseSeverity: Severity;
-	baseDepartment: Department;
-	baseHumanReviewRequired: boolean;
-	baseReasonCodes: string[];
-	baseConfidence: number;
-}
-
-export function buildContext(req: AnalyzeRequest): AnalyzerContext {
+function buildRuleBasedDraft(req: AnalyzeRequest): {
+	agent_summary: string;
+	recommended_next_action: string;
+	customer_reply: string;
+	case_type: CaseType;
+	severity: Severity;
+	department: Department;
+	human_review_required: boolean;
+	confidence: number;
+	reason_codes: string[];
+} {
 	const safeComplaint = stripPromptInjection(req.complaint ?? '');
-	const txnHistory = req.transaction_history ?? [];
-	const match = matchTransaction(safeComplaint, txnHistory);
 	const cls = classifyComplaint(safeComplaint);
+	const match = matchTransaction(safeComplaint, req.transaction_history ?? []);
 
 	let severity = cls.severity;
 	let humanReviewRequired = false;
-	const reasonCodes: string[] = [];
+	const reasonCodes: string[] = ['rule_based'];
 
 	if (match.verdict === 'inconsistent') {
 		reasonCodes.push('evidence_inconsistent');
-		severity = bumpSeverity(severity, 1);
 		humanReviewRequired = true;
 	} else if (match.verdict === 'insufficient_data') {
 		reasonCodes.push('insufficient_data');
@@ -272,11 +275,8 @@ export function buildContext(req: AnalyzeRequest): AnalyzerContext {
 	if (match.transaction) {
 		reasonCodes.push('transaction_match');
 		if (match.transaction.amount >= 20000) {
-			severity = bumpSeverity(severity, 1);
+			severity = cls.severity === 'critical' ? 'critical' : 'high';
 			reasonCodes.push('high_value');
-			humanReviewRequired = true;
-		}
-		if (match.transaction.status === 'failed' && cls.caseType !== 'payment_failed') {
 			humanReviewRequired = true;
 		}
 	} else {
@@ -289,138 +289,100 @@ export function buildContext(req: AnalyzeRequest): AnalyzerContext {
 		severity = 'critical';
 		reasonCodes.push('phishing_signal');
 	}
-	if (cls.caseType === 'wrong_transfer') {
-		reasonCodes.push('wrong_transfer');
-		humanReviewRequired = true;
-	}
-	if (cls.caseType === 'merchant_settlement_delay') {
-		reasonCodes.push('merchant_settlement_delay');
-	}
 
-	// Confidence: blend match score and case-rule hit confidence.
-	const matchConf = Math.min(1, match.score / 8);
-	const ruleConf = cls.hitRule ? 0.8 : 0.4;
-	let confidence = 0.5 * matchConf + 0.5 * ruleConf;
-	if (match.verdict === 'insufficient_data') confidence = Math.min(confidence, 0.55);
-	confidence = Math.max(0.2, Math.min(0.99, Number(confidence.toFixed(2))));
-
-	return {
-		match,
-		classification: cls,
-		baseSeverity: severity,
-		baseDepartment: cls.department,
-		baseHumanReviewRequired: humanReviewRequired,
-		baseReasonCodes: reasonCodes,
-		baseConfidence: confidence
-	};
-}
-
-function buildRuleBasedDraft(
-	req: AnalyzeRequest,
-	ctx: AnalyzerContext
-): {
-	agent_summary: string;
-	recommended_next_action: string;
-	customer_reply: string;
-	case_type: AnalyzeResponse['case_type'];
-	severity: Severity;
-	department: Department;
-	human_review_required: boolean;
-	confidence: number;
-	reason_codes: string[];
-} {
-	const draftReply = buildCustomerReply(
-		ctx.classification.caseType,
-		ctx.match.verdict,
-		ctx.match.transaction
-	);
+	const draftReply = buildCustomerReply(cls.caseType, match.verdict, match.transaction);
 	const draftAction = buildNextAction(
-		ctx.classification.caseType,
-		ctx.match.verdict,
-		ctx.match.transaction,
-		ctx.baseHumanReviewRequired
+		cls.caseType,
+		match.verdict,
+		match.transaction,
+		humanReviewRequired
 	);
+
 	return {
-		agent_summary: buildAgentSummary(req, ctx.classification.caseType, ctx.match.verdict, ctx.match.transaction),
+		agent_summary: buildAgentSummary(cls.caseType, match.verdict, match.transaction),
 		recommended_next_action: hardenRecommendedAction(draftAction),
 		customer_reply: hardenCustomerReply(draftReply),
-		case_type: ctx.classification.caseType,
-		severity: ctx.baseSeverity,
-		department: ctx.baseDepartment,
-		human_review_required: ctx.baseHumanReviewRequired,
-		confidence: ctx.baseConfidence,
-		reason_codes: ctx.baseReasonCodes
+		case_type: cls.caseType,
+		severity,
+		department: cls.department,
+		human_review_required: humanReviewRequired,
+		confidence: 0.7,
+		reason_codes: reasonCodes
 	};
 }
 
+// ---------- Main entry point ----------
+
 export async function analyze(req: AnalyzeRequest): Promise<AnalyzeResponse> {
-	const ctx = buildContext(req);
+	// Matcher always runs — it picks the relevant_transaction_id, which we
+	// never let the LLM invent.
+	const safeComplaint = stripPromptInjection(req.complaint ?? '');
+	const match = matchTransaction(safeComplaint, req.transaction_history ?? []);
+	const relevantTransactionId = match.transaction ? match.transaction.transaction_id : null;
 
-	let draft = buildRuleBasedDraft(req, ctx);
+	const base: AnalyzeResponse = {
+		ticket_id: req.ticket_id,
+		relevant_transaction_id: relevantTransactionId,
+		evidence_verdict: 'insufficient_data',
+		case_type: 'other',
+		severity: 'low',
+		department: 'customer_support',
+		agent_summary: '',
+		recommended_next_action: '',
+		customer_reply: '',
+		human_review_required: false,
+		confidence: 0,
+		reason_codes: []
+	};
 
-	// Optional Gemini refinement. Runs only if the env var is set AND
-	// matches succeeds (we always keep the matcher's verdict and id).
+	// LLM path — preferred. One call, model is the source of truth for
+	// everything except the transaction id (and the post-hoc safety filter).
 	if (isGeminiConfigured()) {
 		try {
 			const llm = await Promise.race([
 				analyzeWithGemini({
 					request: req,
-					relevant_transaction_id: ctx.match.transaction
-						? ctx.match.transaction.transaction_id
-						: null,
-					evidence_verdict: ctx.match.verdict,
-					history_summary: summarizeTxn(ctx.match.transaction)
+					relevant_transaction_id: relevantTransactionId,
+					evidence_verdict: match.verdict,
+					history_summary: summarizeTxn(match.transaction)
 				}),
 				new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error('gemini_timeout')), 20_000)
+					setTimeout(() => reject(new Error('gemini_timeout')), 25_000)
 				)
 			]);
-			draft = {
-				...draft,
+			return {
+				...base,
+				evidence_verdict: llm.evidence_verdict,
 				case_type: llm.case_type,
 				severity: llm.severity,
 				department: llm.department,
 				agent_summary: llm.agent_summary,
 				recommended_next_action: hardenRecommendedAction(llm.recommended_next_action),
 				customer_reply: hardenCustomerReply(llm.customer_reply),
-				human_review_required: llm.human_review_required || draft.human_review_required,
+				human_review_required: llm.human_review_required,
 				confidence: llm.confidence,
-				reason_codes: Array.from(
-					new Set([...draft.reason_codes, ...llm.reason_codes])
-				).slice(0, 10)
+				reason_codes: ['llm', ...llm.reason_codes].slice(0, 10)
 			};
-			draft.reason_codes.unshift('llm_refined');
 		} catch (err) {
-			// Fall back to rule-based on any LLM error so we never break the
-			// 30-second SLA. The matcher verdict is still authoritative.
 			console.warn(
 				'[investigator] Gemini call failed, falling back to rule-based:',
 				err instanceof Error ? err.message : err
 			);
-			draft.reason_codes.unshift('llm_fallback_rule_based');
+			const rule = buildRuleBasedDraft(req);
+			return {
+				...base,
+				evidence_verdict: match.verdict,
+				...rule,
+				reason_codes: ['llm_fallback_rule_based', ...rule.reason_codes].slice(0, 10)
+			};
 		}
-	} else {
-		draft.reason_codes.unshift('rule_based');
 	}
 
-	// Hard override: phishing always critical + always human review.
-	if (draft.case_type === 'phishing_or_social_engineering') {
-		draft.severity = 'critical';
-		draft.human_review_required = true;
-	}
-
+	// No API key — pure rule-based fallback.
+	const rule = buildRuleBasedDraft(req);
 	return {
-		ticket_id: req.ticket_id,
-		relevant_transaction_id: ctx.match.transaction ? ctx.match.transaction.transaction_id : null,
-		evidence_verdict: ctx.match.verdict,
-		case_type: draft.case_type,
-		severity: draft.severity,
-		department: draft.department,
-		agent_summary: draft.agent_summary,
-		recommended_next_action: draft.recommended_next_action,
-		customer_reply: draft.customer_reply,
-		human_review_required: draft.human_review_required,
-		confidence: draft.confidence,
-		reason_codes: draft.reason_codes
+		...base,
+		evidence_verdict: match.verdict,
+		...rule
 	};
 }

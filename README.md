@@ -63,3 +63,29 @@ pnpm dev
 With `GEMINI_API_KEY` set, the service calls `gemini-2.5-flash` (override with `GEMINI_MODEL`) using `responseSchema` to pin every enum to the spec. A 20-second timeout protects the per-request SLA; on any error the service falls back to the rule-based pipeline so the API still answers within 30 seconds. The safety filter in `src/lib/investigator/safety.ts` always runs on the final reply, whether it came from Gemini or from the rule-based draft.
 
 Without a key, the service runs fully offline.
+
+### Running with Docker
+
+The repo ships a multi-stage `Dockerfile` that builds the SvelteKit app and serves it on port `8000`:
+
+```sh
+docker build -t queuestorm-investigator .
+docker run --rm -p 8000:8000 queuestorm-investigator
+```
+
+Then:
+
+```sh
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/analyze-ticket \
+  -H 'content-type: application/json' \
+  -d '{"ticket_id":"TKT-001","complaint":"I sent 5000 taka to a wrong number around 2pm today","transaction_history":[{"transaction_id":"TXN-9101","timestamp":"2026-04-14T14:08:22Z","type":"transfer","amount":5000,"counterparty":"+8801719876543","status":"completed"}]}'
+```
+
+To enable the optional `[redacted]` refinement inside the container:
+
+```sh
+docker run --rm -p 8000:8000 -e GEMINI_API_KEY="$GEMINI_API_KEY" queuestorm-investigator
+```
+
+Override the model with `-e GEMINI_MODEL=...`. Without `GEMINI_API_KEY` the service runs fully offline on the rule-based pipeline.
