@@ -1,0 +1,19 @@
+
+{
+  "ticket_id": "TKT-005",
+  "relevant_transaction_id": null,
+  "evidence_verdict": "insufficient_data",
+  "case_type": "phishing_or_social_engineering",
+  "severity": "critical",
+  "department": "fraud_risk",
+  "agent_summary": "Customer reported a phishing attempt where someone impersonating bKash support asked for an OTP, threatening account blockage. The customer has not shared any sensitive information.",
+  "recommended_next_action": "Advise the customer never to share sensitive information like OTPs. Escalate this report to the fraud investigation team for further review.",
+  "customer_reply": "We will only review this through official support channels. Please do not share any PIN, OTP, password, or card number with anyone — our team will never ask for them.",
+  "human_review_required": true,
+  "confidence": 0.9,
+  "reason_codes": [
+    "llm",
+    "phishing_or_social_engineering",
+    "insufficient_data"
+  ]
+}

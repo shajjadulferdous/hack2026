@@ -269,7 +269,7 @@ ${input.request.complaint}
 Language: ${input.request.language ?? 'en'}
 Channel: ${input.request.channel ?? 'unknown'}
 User type: ${input.request.user_type ?? 'customer'}
-Campaign context: ${input.request.campaign_context ?? 'none'}
+
 
 Recent transactions (JSON):
 ${txnsJson}

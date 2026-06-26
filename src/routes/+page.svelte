@@ -39,7 +39,6 @@
 	let language = $state<(typeof languages)[number]>('en');
 	let channel = $state<(typeof channels)[number]>('in_app_chat');
 	let user_type = $state<(typeof userTypes)[number]>('customer');
-	let campaign_context = $state('boishakh_bonanza_day_1');
 
 	let txns = $state<TxnDraft[]>([
 		{
@@ -129,7 +128,6 @@
 				language,
 				channel,
 				user_type,
-				campaign_context: campaign_context.trim() || undefined,
 				transaction_history: txns.map((t) => ({
 					transaction_id: t.transaction_id.trim(),
 					timestamp: new Date(t.timestamp).toISOString(),
@@ -225,13 +223,6 @@
 							class="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
 							bind:value={ticket_id}
 							required
-						/>
-					</label>
-					<label class="block">
-						<span class="text-sm font-medium text-slate-700">Campaign context</span>
-						<input
-							class="mt-1 block w-full rounded-md border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
-							bind:value={campaign_context}
 						/>
 					</label>
 				</div>

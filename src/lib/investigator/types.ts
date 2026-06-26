@@ -35,7 +35,6 @@ export interface AnalyzeRequest {
 	language?: Language;
 	channel?: Channel;
 	user_type?: UserType;
-	campaign_context?: string;
 	transaction_history?: Transaction[];
 	metadata?: Record<string, unknown>;
 }

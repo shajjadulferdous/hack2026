@@ -109,7 +109,6 @@ export const POST: RequestHandler = async ({ request }) => {
 		language: body.language as AnalyzeRequest['language'],
 		channel: body.channel as AnalyzeRequest['channel'],
 		user_type: body.user_type as AnalyzeRequest['user_type'],
-		campaign_context: typeof body.campaign_context === 'string' ? body.campaign_context : undefined,
 		transaction_history: txns,
 		metadata: body.metadata as Record<string, unknown> | undefined
 	};
